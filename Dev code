@@ -1,0 +1,215 @@
+// DEV: receive stream on Serial2 (RX2=16), decode JPEG to TFT, UI + Boot-button save (PAUSE->SAVE->RESUME)
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <WiFi.h>
+#include "time.h"
+
+#define RX2_PIN 16
+#define TX2_PIN 17
+#define BOOT_BTN 0
+#define FLASH_PIN 2
+#define CMD_PAUSE 'P'
+#define CMD_SAVE  'S'
+#define CMD_RESUME 'R'
+#define ACK_NORMAL 0x55
+#define SYNC_MARK 0xAA55AA55UL
+
+const char* WIFI_SSID = "MATHAN"; // set or leave blank
+const char* WIFI_PASS = "19770821";
+const long DEV_GMT_OFFSET_SEC = 5 * 3600 + 30 * 60;
+const int DEV_DAYLIGHT_OFFSET_SEC = 0;
+const char* DEV_NTP_SERVER = "pool.ntp.org";
+
+TFT_eSPI tft = TFT_eSPI();
+uint8_t *jpgBuf = nullptr;
+size_t jpgBufSize = 0;
+size_t lastImgSize = 0;
+
+bool tftCallback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+  tft.pushImage(x, y, w, h, bitmap);
+  return true;
+}
+
+String readLineFromCam(unsigned long timeoutMs=2000) {
+  unsigned long t0 = millis();
+  String s = "";
+  while (millis()-t0 < timeoutMs) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      if (c == '\n') return s;
+      if (c == '\r') continue;
+      s += c;
+      if (s.length() > 512) return s;
+    }
+    delay(1);
+  }
+  return s;
+}
+
+String getTS() {
+  struct tm tm;
+  char buf[32];
+  if (getLocalTime(&tm)) strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+  else sprintf(buf, "uptime_%lu", millis()/1000);
+  return String(buf);
+}
+
+void sendPause() {
+  while (Serial2.available()) Serial2.read();
+  Serial2.write((uint8_t)CMD_PAUSE);
+  Serial2.flush();
+}
+
+void sendSave(const String &ts) {
+  Serial2.write((uint8_t)CMD_SAVE);
+  Serial2.print("\n");
+  Serial2.print(ts);
+  Serial2.print("\n");
+  Serial2.flush();
+}
+
+void sendResume() {
+  Serial2.write((uint8_t)CMD_RESUME);
+  Serial2.flush();
+}
+
+void doFlashOnce() {
+  digitalWrite(FLASH_PIN, HIGH);
+  tft.fillRect(0,0,tft.width(),tft.height(),TFT_WHITE);
+  delay(110);
+  digitalWrite(FLASH_PIN, LOW);
+  if (jpgBuf && lastImgSize>0) TJpgDec.drawJpg(0,0,jpgBuf,lastImgSize);
+}
+
+String getTimeUI() {
+  struct tm tm;
+  if (getLocalTime(&tm)) {
+    char b[40]; strftime(b, sizeof(b), "%d-%b-%Y %H:%M:%S", &tm);
+    return String(b);
+  } else {
+    unsigned long s = millis()/1000; unsigned long h=s/3600,m=(s/60)%60,sec=s%60;
+    char b[40]; sprintf(b,"Uptime %02lu:%02lu:%02lu",h,m,sec); return String(b);
+  }
+}
+
+void drawTopBar(const String &tstr) {
+  tft.fillRect(0,0,tft.width(),28,TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE,TFT_DARKGREY);
+  tft.setTextSize(2);
+  tft.setCursor(8,3); tft.print("DIGICAM");
+  tft.setTextSize(1); tft.setCursor(tft.width()-160,8); tft.print(tstr);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(921600, SERIAL_8N1, RX2_PIN, TX2_PIN); // match CAM
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
+
+  tft.init(); tft.setRotation(1); tft.setSwapBytes(true); tft.fillScreen(TFT_BLACK);
+  TJpgDec.setCallback(tftCallback);
+  TJpgDec.setJpgScale(1);
+
+  if (strlen(WIFI_SSID)>0) {
+    WiFi.begin(WIFI_SSID,WIFI_PASS);
+    unsigned long t0=millis();
+    while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000) delay(200);
+    if (WiFi.status()==WL_CONNECTED) {
+      configTime(DEV_GMT_OFFSET_SEC, DEV_DAYLIGHT_OFFSET_SEC, DEV_NTP_SERVER);
+      unsigned long t1=millis(); struct tm t; while(!getLocalTime(&t) && millis()-t1<3000) delay(200);
+    }
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+  }
+
+  tft.fillScreen(TFT_BLACK);
+  drawTopBar(getTimeUI());
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCentreString("Waiting for livefeed...", tft.width()/2, tft.height()/2, 2);
+}
+
+void loop() {
+  // receive frame
+  if (Serial2.available() >= 8) {
+    uint32_t sync; Serial2.readBytes((uint8_t*)&sync,4);
+    if (sync != SYNC_MARK) { if (Serial2.available()) Serial2.read(); return; }
+    uint32_t imgSize; Serial2.readBytes((uint8_t*)&imgSize,4);
+    if (imgSize < 120 || imgSize > 400000) return;
+
+    if (imgSize > jpgBufSize) {
+      if (jpgBuf) free(jpgBuf);
+      jpgBuf = (uint8_t*)malloc(imgSize);
+      if (!jpgBuf) { jpgBufSize=0; lastImgSize=0; return; }
+      jpgBufSize = imgSize;
+    }
+
+    uint32_t rec = 0; unsigned long t0 = millis();
+    while (rec < imgSize && millis()-t0 < 4000) {
+      if (Serial2.available()) {
+        int got = Serial2.read((char*)jpgBuf + rec, imgSize - rec);
+        if (got > 0) rec += got;
+      }
+      yield();
+    }
+
+    if (rec == imgSize) {
+      TJpgDec.drawJpg(0,0,jpgBuf,imgSize);
+      lastImgSize = imgSize;
+      tft.setTextColor(TFT_WHITE, TFT_TRANSPARENT);
+      tft.setTextSize(1);
+      tft.drawString(getTimeUI(),8,4,1);
+    }
+    drawTopBar(getTimeUI());
+    Serial2.write((uint8_t)ACK_NORMAL);
+  }
+
+  // BOOT button (take photo)
+  static int lastBtn=HIGH;
+  int btn = digitalRead(BOOT_BTN);
+  if (lastBtn == HIGH && btn == LOW) {
+    // try pause with retries
+    bool paused = false;
+    for (int i=0;i<3 && !paused;i++) {
+      sendPause();
+      String r = readLineFromCam(1200);
+      if (r == "PAUSE") paused = true;
+      else delay(160);
+    }
+    if (!paused) {
+      tft.fillRect(0,tft.height()-28,tft.width(),28,TFT_BLACK);
+      tft.setTextColor(TFT_RED); tft.drawCentreString("Pause failed", tft.width()/2, tft.height()-20, 2);
+      sendResume(); delay(400);
+    } else {
+      // flash & save
+      doFlashOnce();
+      tft.fillRect(0,tft.height()-28,tft.width(),28,TFT_BLACK);
+      tft.setTextColor(TFT_YELLOW); tft.drawCentreString("📸 Saving...", tft.width()/2, tft.height()-20, 2);
+
+      String ts = getTS();
+      sendSave(ts);
+      String resp = readLineFromCam(4000);
+      if (resp.length()) {
+        if (resp.charAt(0)=='K') {
+          String name = resp.substring(1); name.trim();
+          tft.fillRect(0,tft.height()-28,tft.width(),28,TFT_BLACK);
+          tft.setTextColor(TFT_GREEN); tft.drawCentreString("Saved: " + name, tft.width()/2, tft.height()-20, 2);
+        } else {
+          tft.fillRect(0,tft.height()-28,tft.width(),28,TFT_BLACK);
+          tft.setTextColor(TFT_RED); tft.drawCentreString("CAM Save Error", tft.width()/2, tft.height()-20, 2);
+        }
+      } else {
+        tft.fillRect(0,tft.height()-28,tft.width(),28,TFT_BLACK);
+        tft.setTextColor(TFT_RED); tft.drawCentreString("Save timeout", tft.width()/2, tft.height()-20, 2);
+      }
+
+      // resume
+      sendResume();
+      String r = readLineFromCam(1000); // optional
+      delay(400);
+      drawTopBar(getTimeUI());
+    }
+  }
+  lastBtn = btn;
+
+  delay(3);
+}
