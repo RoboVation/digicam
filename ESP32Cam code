@@ -1,0 +1,160 @@
+
+#include "esp_camera.h"
+#include "FS.h"
+#include "SD_MMC.h"
+
+#define SYNC_MARK 0xAA55AA55UL
+#define CMD_PAUSE 'P'
+#define CMD_SAVE  'S'
+#define CMD_RESUME 'R'
+#define ACK_OK    'K'
+#define ERR_CHAR  'E'
+
+/* AI-Thinker pin map */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+bool paused = false;
+
+String readLine(int timeoutMs = 800) {
+  unsigned long t0 = millis();
+  String s = "";
+  while (millis() - t0 < timeoutMs) {
+    if (Serial.available()) {
+      char c = (char)Serial.read();
+      if (c == '\r') continue;
+      if (c == '\n') return s;
+      s += c;
+      if (s.length() > 256) return s;
+    } else delay(1);
+  }
+  return s;
+}
+
+bool writeFile(const String &path, uint8_t *buf, size_t len, int tries = 3) {
+  for (int i=0;i<tries;i++) {
+    File f = SD_MMC.open(path.c_str(), FILE_WRITE);
+    if (!f) { delay(120); continue; }
+    size_t w = f.write(buf, len);
+    f.close();
+    if (w == len) return true;
+    delay(120);
+  }
+  return false;
+}
+
+void saveFrameName(const String &name) {
+  // capture fresh fb with retries
+  camera_fb_t *fb = nullptr;
+  for (int i=0;i<4;i++) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    delay(120);
+  }
+  if (!fb) {
+    Serial.print(ERR_CHAR); Serial.print(name); Serial.print("\n");
+    return;
+  }
+  String path = "/" + name + ".jpg";
+  bool ok = writeFile(path, fb->buf, fb->len, 4);
+  if (ok) {
+    Serial.print(ACK_OK); Serial.print(name); Serial.print("\n");
+  } else {
+    Serial.print(ERR_CHAR); Serial.print(name); Serial.print("\n");
+  }
+  esp_camera_fb_return(fb);
+}
+
+void processCommands() {
+  // read all available bytes and act on commands
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == CMD_PAUSE) {
+      paused = true;
+      Serial.print("PAUSE\n");
+    } else if (c == CMD_RESUME) {
+      paused = false;
+      Serial.print("RESUME\n");
+    } else if (c == CMD_SAVE) {
+      // consume rest of line (if any)
+      readLine(60);
+      // read timestamp line (longer)
+      String ts = readLine(3000);
+      if (ts.length() == 0) ts = String(millis());
+      saveFrameName(ts);
+      // remain paused after save (DEV will RESUME)
+    } else {
+      // ignore other bytes
+    }
+    // don't hog CPU
+    delay(0);
+  }
+}
+
+void setup() {
+  Serial.begin(921600); // HIGH baud; match DEV
+  Serial.setDebugOutput(false);
+
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM; cfg.pin_d2 = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM; cfg.pin_d6 = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk = XCLK_GPIO_NUM; cfg.pin_pclk = PCLK_GPIO_NUM;
+  cfg.pin_vsync = VSYNC_GPIO_NUM; cfg.pin_href = HREF_GPIO_NUM;
+  cfg.pin_sccb_sda = SIOD_GPIO_NUM; cfg.pin_sccb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn = PWDN_GPIO_NUM; cfg.pin_reset = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size = FRAMESIZE_QVGA; // 320x240 (good for TFT)
+  cfg.jpeg_quality = 8;
+  cfg.fb_count = 2;
+
+  if (esp_camera_init(&cfg) != ESP_OK) {
+    Serial.println("Camera init failed");
+    while (1) delay(1000);
+  }
+
+  if (!SD_MMC.begin()) {
+    Serial.println("SD_MMC init failed (check card & 5V)");
+  } else {
+    Serial.println("SD mounted OK");
+  }
+
+  Serial.println("CAM ready");
+}
+
+void loop() {
+  // always process incoming bytes first so commands aren't missed
+  processCommands();
+
+  if (paused) { delay(5); return; }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) { delay(5); return; }
+
+  uint32_t sync = SYNC_MARK;
+  uint32_t len = fb->len;
+  Serial.write((uint8_t*)&sync, 4);
+  Serial.write((uint8_t*)&len, 4);
+  Serial.write(fb->buf, len);
+  Serial.flush();
+  esp_camera_fb_return(fb);
+
+  // small gap
+  delay(8);
+}
